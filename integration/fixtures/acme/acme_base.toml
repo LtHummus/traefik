@@ -19,6 +19,9 @@
   storage = "/tmp/acme.json"
   keyType = "{{ $resolvers.ACME.KeyType }}"
   caServer = "{{ $resolvers.ACME.CAServer }}"
+  {{if $resolvers.ACME.DisableARI }}
+  disableARI = true
+  {{end}}
 
   {{if $resolvers.ACME.HTTPChallenge }}
   [certificatesResolvers.{{ $name }}.acme.httpChallenge]

@@ -3,11 +3,15 @@ package integration
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,7 +25,6 @@ import (
 	"github.com/traefik/traefik/v3/pkg/provider/acme"
 	"github.com/traefik/traefik/v3/pkg/testhelpers"
 	"github.com/traefik/traefik/v3/pkg/types"
-	"k8s.io/utils/strings/slices"
 )
 
 // ACME test suites.
@@ -217,6 +220,28 @@ func (s *AcmeSuite) TestHTTP01OnHostRule() {
 			Acme: map[string]static.CertificateResolver{
 				"default": {ACME: &acme.Configuration{
 					HTTPChallenge: &acme.HTTPChallenge{EntryPoint: "web"},
+				}},
+			},
+		},
+	}
+
+	s.retrieveAcmeCertificate(testCase)
+}
+
+func (s *AcmeSuite) TestHTTP01_ARIEnabled_IssuesCertificate() {
+	testCase := acmeTestCase{
+		traefikConfFilePath: "fixtures/acme/acme_domains.toml",
+		subCases: []subCases{{
+			host:              acmeDomain,
+			expectedDomain:    acmeDomain,
+			expectedAlgorithm: x509.RSA,
+		}},
+		template: templateModel{
+			Domains: []types.Domain{{Main: acmeDomain}},
+			Acme: map[string]static.CertificateResolver{
+				"default": {ACME: &acme.Configuration{
+					HTTPChallenge: &acme.HTTPChallenge{EntryPoint: "web"},
+					DisableARI:    false,
 				}},
 			},
 		},
@@ -445,7 +470,56 @@ func (s *AcmeSuite) TestNoValidLetsEncryptServer() {
 	require.NoError(s.T(), err)
 }
 
-// Doing an HTTPS request and test the response certificate.
+func (s *AcmeSuite) TestHTTP01_ARIDrivenRenewal() {
+	var mu sync.Mutex
+	var firstCertID string
+
+	proxyURL, renewalChecks := startARIProxy(s.T(), s.pebbleIP, func(certID string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if firstCertID == "" {
+			firstCertID = certID
+		}
+		return certID == firstCertID
+	})
+
+	firstSerial, getCurrentSerial := s.startTraefikForARI(proxyURL)
+
+	err := try.Do(3*time.Minute, func() error {
+		got, err := getCurrentSerial()
+		if err != nil {
+			return err
+		}
+		if got.Cmp(firstSerial) == 0 {
+			return fmt.Errorf("certificate not renewed yet (serial still %s)", got)
+		}
+		return nil
+	})
+	require.NoError(s.T(), err)
+
+	assert.Positive(s.T(), renewalChecks.Load())
+}
+
+func (s *AcmeSuite) TestHTTP01_ARISaysDoNotRenew() {
+	proxyURL, renewalChecks := startARIProxy(s.T(), s.pebbleIP, func(string) bool { return false })
+
+	firstSerial, getCurrentSerial := s.startTraefikForARI(proxyURL)
+
+	err := try.Do(2*time.Minute, func() error {
+		if got := renewalChecks.Load(); got < 2 {
+			return fmt.Errorf("ARI consulted only %d times", got)
+		}
+		return nil
+	})
+	require.NoError(s.T(), err)
+
+	// ARI says we shouldn't renew, so validate that we didn't
+	got, err := getCurrentSerial()
+	require.NoError(s.T(), err)
+	assert.Equal(s.T(), firstSerial, got)
+}
+
+// Do an HTTPS request and test the response certificate.
 func (s *AcmeSuite) retrieveAcmeCertificate(testCase acmeTestCase) {
 	if len(testCase.template.PortHTTP) == 0 {
 		testCase.template.PortHTTP = ":5002"
@@ -465,7 +539,6 @@ func (s *AcmeSuite) retrieveAcmeCertificate(testCase acmeTestCase) {
 
 	s.traefikCmd(withConfigFile(file))
 
-	// A real file is needed to have the right mode on acme.json file
 	defer os.Remove("/tmp/acme.json")
 
 	backend := startTestServer("9010", http.StatusOK, "")
@@ -477,7 +550,7 @@ func (s *AcmeSuite) retrieveAcmeCertificate(testCase acmeTestCase) {
 		},
 	}
 
-	// wait for traefik (generating acme account take some seconds)
+	// wait for traefik (generating acme account + certs is not immedate)
 	err := try.Do(60*time.Second, func() error {
 		_, errGet := client.Get("https://127.0.0.1:5001")
 		return errGet
@@ -491,7 +564,7 @@ func (s *AcmeSuite) retrieveAcmeCertificate(testCase acmeTestCase) {
 					InsecureSkipVerify: true,
 					ServerName:         sub.host,
 				},
-				// Needed so that each subcase redoes the SSL handshake
+				// Needed so we do the TLS handshake every time to get an updated cert
 				DisableKeepAlives: true,
 			},
 		}
@@ -517,7 +590,6 @@ func (s *AcmeSuite) retrieveAcmeCertificate(testCase acmeTestCase) {
 			gotStatusCode = resp.StatusCode
 			gotPublicKeyAlgorithm = resp.TLS.PeerCertificates[0].PublicKeyAlgorithm
 
-			// Here we are collecting the common name as it is used in wildcard tests.
 			gotDomains = append(gotDomains, resp.TLS.PeerCertificates[0].Subject.CommonName)
 			gotDomains = append(gotDomains, resp.TLS.PeerCertificates[0].DNSNames...)
 
@@ -531,10 +603,65 @@ func (s *AcmeSuite) retrieveAcmeCertificate(testCase acmeTestCase) {
 		require.NoError(s.T(), err)
 		assert.Equal(s.T(), http.StatusOK, gotStatusCode)
 
-		// Check Domain into response certificate
 		assert.Contains(s.T(), gotDomains, sub.expectedDomain)
 		assert.Equal(s.T(), sub.expectedAlgorithm, gotPublicKeyAlgorithm)
 	}
+}
+
+// startTraefikForARI launches Traefik against the given ARI proxy directory and waits for the initial
+// certificate to be issued. It returns two things -- the certificate of the first issued certificate
+// and a function that can be called to fetch the current certificate's serial number in order to detect
+// when the cert has been renewed (or hasn't ...). Also registers cleanup on the test.
+func (s *AcmeSuite) startTraefikForARI(proxyURL string) (*big.Int, func() (*big.Int, error)) {
+	template := templateModel{
+		Domains:   []types.Domain{{Main: acmeDomain}},
+		PortHTTP:  ":5002",
+		PortHTTPS: ":5001",
+		Acme: map[string]static.CertificateResolver{
+			"default": {ACME: &acme.Configuration{
+				HTTPChallenge:        &acme.HTTPChallenge{EntryPoint: "web"},
+				CAServer:             proxyURL + "/dir",
+				CertificatesDuration: 1, // in hours, minimum to make the re-check loop fast
+			}},
+		},
+	}
+
+	file := s.adaptFile("fixtures/acme/acme_domains.toml", template)
+	s.traefikCmd(withConfigFile(file))
+	s.T().Cleanup(func() { _ = os.Remove("/tmp/acme.json") })
+
+	backend := startTestServer("9010", http.StatusOK, "")
+	s.T().Cleanup(backend.Close)
+
+	client := &http.Client{Transport: &http.Transport{
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, ServerName: acmeDomain},
+		DisableKeepAlives: true, // force a fresh handshake each call so we observe cert changes.
+	}}
+
+	servedSerial := func() (*big.Int, error) {
+		req := testhelpers.MustNewRequest(http.MethodGet, "https://127.0.0.1:5001/", nil)
+		req.Host = acmeDomain
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if len(resp.TLS.PeerCertificates) == 0 {
+			return nil, errors.New("no peer certificate yet")
+		}
+		return resp.TLS.PeerCertificates[0].SerialNumber, nil
+	}
+
+	var firstSerial *big.Int
+	err := try.Do(60*time.Second, func() error {
+		var err error
+		firstSerial, err = servedSerial()
+		return err
+	})
+	require.NoError(s.T(), err)
+	require.NotNil(s.T(), firstSerial)
+
+	return firstSerial, servedSerial
 }
 
 func (s *AcmeSuite) getAcmeURL() string {
