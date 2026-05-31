@@ -3,7 +3,6 @@ package acme
 import (
 	"crypto/tls"
 	"testing"
-	"time"
 
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/stretchr/testify/assert"
@@ -577,79 +576,6 @@ func TestInitAccount(t *testing.T) {
 			assert.NoError(t, err, "Init account in error")
 			assert.Equal(t, test.expectedAccount.Email, actualAccount.Email, "unexpected email account")
 			assert.Equal(t, test.expectedAccount.KeyType, actualAccount.KeyType, "unexpected keyType account")
-		})
-	}
-}
-
-func Test_getCertificateRenewDurations(t *testing.T) {
-	testCases := []struct {
-		desc                  string
-		certificatesDurations int
-		expectRenewPeriod     time.Duration
-		expectRenewInterval   time.Duration
-	}{
-		{
-			desc:                  "Less than 24 Hours certificates: 20 minutes renew period, 1 minutes renew interval",
-			certificatesDurations: 1,
-			expectRenewPeriod:     time.Minute * 20,
-			expectRenewInterval:   time.Minute,
-		},
-		{
-			desc:                  "1 Year certificates: 4 months renew period, 1 week renew interval",
-			certificatesDurations: 24 * 365,
-			expectRenewPeriod:     time.Hour * 24 * 30 * 4,
-			expectRenewInterval:   time.Hour * 24 * 7,
-		},
-		{
-			desc:                  "265 Days certificates: 30 days renew period, 1 day renew interval",
-			certificatesDurations: 24 * 265,
-			expectRenewPeriod:     time.Hour * 24 * 30,
-			expectRenewInterval:   time.Hour * 24,
-		},
-		{
-			desc:                  "90 Days certificates: 30 days renew period, 1 day renew interval",
-			certificatesDurations: 24 * 90,
-			expectRenewPeriod:     time.Hour * 24 * 30,
-			expectRenewInterval:   time.Hour * 24,
-		},
-		{
-			desc:                  "45 Days certificates (Let's Encrypt 2028 standard): 10 days renew period, 12 hour renew interval",
-			certificatesDurations: 24 * 45,
-			expectRenewPeriod:     time.Hour * 24 * 10,
-			expectRenewInterval:   time.Hour * 12,
-		},
-		{
-			desc:                  "30 Days certificates: 10 days renew period, 12 hour renew interval",
-			certificatesDurations: 24 * 30,
-			expectRenewPeriod:     time.Hour * 24 * 10,
-			expectRenewInterval:   time.Hour * 12,
-		},
-		{
-			desc:                  "7 Days certificates: 2 days renew period, 2 hour renew interval",
-			certificatesDurations: 24 * 7,
-			expectRenewPeriod:     time.Hour * 24 * 2,
-			expectRenewInterval:   time.Hour * 2,
-		},
-		{
-			desc:                  "160 hour certificate (Let's Encrypt 'shortlived' profile): 2 days renew period, 2 hour renew interval",
-			certificatesDurations: 160,
-			expectRenewPeriod:     time.Hour * 24 * 2,
-			expectRenewInterval:   time.Hour * 2,
-		},
-		{
-			desc:                  "24 Hours certificates: 6 hours renew period, 10 minutes renew interval",
-			certificatesDurations: 24,
-			expectRenewPeriod:     time.Hour * 6,
-			expectRenewInterval:   time.Minute * 10,
-		},
-	}
-	for _, test := range testCases {
-		t.Run(test.desc, func(t *testing.T) {
-			t.Parallel()
-
-			renewPeriod, renewInterval := getCertificateRenewDurations(test.certificatesDurations)
-			assert.Equal(t, test.expectRenewPeriod, renewPeriod)
-			assert.Equal(t, test.expectRenewInterval, renewInterval)
 		})
 	}
 }

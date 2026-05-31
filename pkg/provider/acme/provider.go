@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -52,6 +53,7 @@ type Configuration struct {
 	KeyType              string   `description:"KeyType used for generating certificate private key. Allow value 'EC256', 'EC384', 'RSA2048', 'RSA4096', 'RSA8192'." json:"keyType,omitempty" toml:"keyType,omitempty" yaml:"keyType,omitempty" export:"true"`
 	EAB                  *EAB     `description:"External Account Binding to use." json:"eab,omitempty" toml:"eab,omitempty" yaml:"eab,omitempty"`
 	CertificatesDuration int      `description:"Certificates' duration in hours." json:"certificatesDuration,omitempty" toml:"certificatesDuration,omitempty" yaml:"certificatesDuration,omitempty" export:"true"`
+	DisableARI           bool     `description:"Disable ACME Renewal Information (ARI) for certificate renewals." json:"disableARI,omitempty" toml:"disableARI,omitempty" yaml:"disableARI,omitempty" export:"true"`
 
 	ClientTimeout               ptypes.Duration `description:"Timeout for a complete HTTP transaction with the ACME server." json:"clientTimeout,omitempty" toml:"clientTimeout,omitempty" yaml:"clientTimeout,omitempty" label:"allowEmpty" file:"allowEmpty" export:"true"`
 	ClientResponseHeaderTimeout ptypes.Duration `description:"Timeout for receiving the response headers when communicating with the ACME server." json:"clientResponseHeaderTimeout,omitempty" toml:"clientResponseHeaderTimeout,omitempty" yaml:"clientResponseHeaderTimeout,omitempty" label:"allowEmpty" file:"allowEmpty" export:"true"`
@@ -250,20 +252,35 @@ func (p *Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.
 
 	p.configurationChan <- msg
 
-	renewPeriod, renewInterval := getCertificateRenewDurations(p.CertificatesDuration)
-	logger.Debug().Msgf("Attempt to renew certificates %q before expiry and check every %q",
-		renewPeriod, renewInterval)
+	p.certificatesMu.RLock()
 
-	p.renewCertificates(ctx, renewPeriod)
+	// there's a weird quirk for folks using the `shortlived` profile for LetsEncrypt. If they don't explicitly set the
+	// CertificatesDuration, we assume its 90 days and will immediately renew which can cause issues down the line. So
+	// here, look at any certs we have and compute periods and intervals off the shortest. note that this will likely
+	// get blown away immediately if the user is using ARI
+	minCertificateDuration := p.CertificatesDuration
+	for _, curr := range p.certificates {
+		x509Cert, err := getX509Certificate(ctx, &curr.Certificate)
+		if err != nil {
+			logger.Warn().Msgf("could not parse certificate: %+v", err)
+			continue
+		}
+		certDurationHours := int(math.Floor(x509Cert.NotAfter.Sub(x509Cert.NotBefore).Hours()))
+		minCertificateDuration = min(certDurationHours, minCertificateDuration)
+	}
+	p.certificatesMu.RUnlock()
 
-	ticker := time.NewTicker(renewInterval)
+	_, renewInterval := getCertificateRenewDurations(minCertificateDuration)
+
+	timeTillNextCheck := p.renewCertificates(ctx, renewInterval)
+
 	pool.GoCtx(func(ctxPool context.Context) {
 		for {
+			logger.Info().Msgf("Sleeping %.2f minutes until next cert renewal check", timeTillNextCheck.Minutes())
 			select {
-			case <-ticker.C:
-				p.renewCertificates(ctx, renewPeriod)
+			case <-time.After(timeTillNextCheck):
+				timeTillNextCheck = p.renewCertificates(ctx, renewInterval)
 			case <-ctxPool.Done():
-				ticker.Stop()
 				return
 			}
 		}
@@ -801,26 +818,6 @@ func (p *Provider) addCertificateForDomain(domain types.Domain, crt *certificate
 	return p.Store.SaveCertificates(p.ResolverName, p.certificates)
 }
 
-// getCertificateRenewDurations returns renew durations calculated from the given certificatesDuration in hours.
-// The first (RenewPeriod) is the period before the end of the certificate duration, during which the certificate should be renewed.
-// The second (RenewInterval) is the interval between renew attempts.
-func getCertificateRenewDurations(certificatesDuration int) (time.Duration, time.Duration) {
-	switch {
-	case certificatesDuration >= 365*24: // >= 1 year
-		return 4 * 30 * 24 * time.Hour, 7 * 24 * time.Hour // 4 month, 1 week
-	case certificatesDuration >= 3*30*24: // >= 90 days
-		return 30 * 24 * time.Hour, 24 * time.Hour // 30 days, 1 day
-	case certificatesDuration >= 30*24: // >= 30 days
-		return 10 * 24 * time.Hour, 12 * time.Hour // 10 days, 12 hours
-	case certificatesDuration >= 6*24: // >= 6 days
-		return 2 * 24 * time.Hour, 2 * time.Hour // 2 days, 2 hours
-	case certificatesDuration >= 24: // >= 1 days
-		return 6 * time.Hour, 10 * time.Minute // 6 hours, 10 minutes
-	default:
-		return 20 * time.Minute, time.Minute
-	}
-}
-
 // deleteUnnecessaryDomains deletes from the configuration :
 // - Duplicated domains
 // - Domains which are checked by wildcard domain.
@@ -905,64 +902,6 @@ func (p *Provider) buildMessage() dynamic.Message {
 	return conf
 }
 
-func (p *Provider) renewCertificates(ctx context.Context, renewPeriod time.Duration) {
-	logger := log.Ctx(ctx)
-
-	logger.Info().Msg("Testing certificate renew...")
-
-	p.certificatesMu.RLock()
-
-	var certificates []*CertAndStore
-	for _, cert := range p.certificates {
-		crt, err := getX509Certificate(ctx, &cert.Certificate)
-		// If there's an error, we assume the cert is broken, and needs update
-		if err != nil || crt == nil || crt.NotAfter.Before(time.Now().Add(renewPeriod)) {
-			certificates = append(certificates, cert)
-		}
-	}
-
-	p.certificatesMu.RUnlock()
-
-	for _, cert := range certificates {
-		client, err := p.getClient()
-		if err != nil {
-			logger.Info().Err(err).Msgf("Error renewing ACME certificate: %+v", cert.Domain)
-			continue
-		}
-
-		logger.Info().Msgf("Renewing ACME certificate: %+v", cert.Domain)
-
-		res := certificate.Resource{
-			Domain:      cert.Domain.Main,
-			PrivateKey:  cert.Key,
-			Certificate: cert.Certificate.Certificate,
-		}
-
-		opts := &certificate.RenewOptions{
-			Bundle:         true,
-			EmailAddresses: p.EmailAddresses,
-			Profile:        p.Profile,
-			PreferredChain: p.PreferredChain,
-		}
-
-		renewedCert, err := client.Certificate.RenewWithOptions(res, opts)
-		if err != nil {
-			logger.Error().Err(err).Msgf("Error renewing ACME certificate: %v", cert.Domain)
-			continue
-		}
-
-		if len(renewedCert.Certificate) == 0 || len(renewedCert.PrivateKey) == 0 {
-			logger.Error().Msgf("domains %v renew certificate with no value: %v", cert.Domain.ToStrArray(), cert)
-			continue
-		}
-
-		err = p.addCertificateForDomain(cert.Domain, renewedCert, cert.Store)
-		if err != nil {
-			logger.Error().Err(err).Msg("Error adding certificate for domain")
-		}
-	}
-}
-
 // Get provided certificate which check a domains list (Main and SANs)
 // from static and dynamic provided certificates.
 func (p *Provider) getUncheckedDomains(ctx context.Context, domainsToCheck []string, tlsStore string) []string {
@@ -1017,27 +956,32 @@ func searchUncheckedDomains(ctx context.Context, domainsToCheck, existentDomains
 	return uncheckedDomains
 }
 
-func getX509Certificate(ctx context.Context, cert *Certificate) (*x509.Certificate, error) {
-	logger := log.Ctx(ctx)
-
-	tlsCert, err := tls.X509KeyPair(cert.Certificate, cert.Key)
+func getX509CertificateFromBytes(certBytes []byte, keyBytes []byte) (*x509.Certificate, error) {
+	tlsCert, err := tls.X509KeyPair(certBytes, keyBytes)
 	if err != nil {
-		logger.Error().Err(err).
-			Str("domain", cert.Domain.Main).
-			Strs("SANs", cert.Domain.SANs).
-			Msg("Failed to load TLS key pair from ACME certificate for domain, certificate will be renewed")
-		return nil, err
+		return nil, fmt.Errorf("getX509CertificateFromBytes: failed to load TLS key pair from ACME certificate for domain: %w", err)
 	}
 
 	crt := tlsCert.Leaf
 	if crt == nil {
 		crt, err = x509.ParseCertificate(tlsCert.Certificate[0])
 		if err != nil {
-			logger.Error().Err(err).
-				Str("domain", cert.Domain.Main).
-				Strs("SANs", cert.Domain.SANs).
-				Msg("Failed to parse TLS key pair from ACME certificate for domain, certificate will be renewed")
+			return nil, fmt.Errorf("getX509CertificateFromBytes: failed to parse TLS key pair from ACME certificate for domain, certificate will be renewed")
 		}
+	}
+
+	return crt, err
+}
+
+func getX509Certificate(ctx context.Context, cert *Certificate) (*x509.Certificate, error) {
+	logger := log.Ctx(ctx)
+
+	crt, err := getX509CertificateFromBytes(cert.Certificate, cert.Key)
+	if err != nil {
+		logger.Error().Err(err).
+			Str("domain", cert.Domain.Main).
+			Strs("SANs", cert.Domain.SANs).
+			Msg("failed to parse certificate, certificate will be renewed")
 	}
 
 	return crt, err
