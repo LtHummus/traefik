@@ -15,7 +15,7 @@ const isLinkableHostname = (value?: string) => {
 export const CertificateDetails = ({ certificate }: { certificate: Certificate.Info }) => {
   const validFrom = new Date(certificate.notBefore)
   const validUntil = new Date(certificate.notAfter)
-  const certStatus = useMemo(() => getCertExpiryStatus(certificate.daysLeft), [certificate.daysLeft])
+  const certStatus = useMemo(() => getCertExpiryStatus(certificate.fractionRemaining), [certificate.fractionRemaining])
 
   const issuedToItems = [
     {
@@ -75,7 +75,7 @@ export const CertificateDetails = ({ certificate }: { certificate: Certificate.I
     { key: 'Valid Until', val: validUntil.toLocaleString() },
     {
       key: 'Expiry',
-      val: <CertExpiryBadge daysLeft={certificate.daysLeft} />,
+      val: <CertExpiryBadge fractionRemaining={certificate.fractionRemaining} daysLeft={certificate.daysLeft} />,
     },
   ]
 

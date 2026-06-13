@@ -69,7 +69,7 @@ describe('<CertificatePage />', () => {
     }
 
     vi.spyOn(useCertificates, 'useCertificate').mockImplementation(() => ({
-      certificate: { ...mockCertificate, daysLeft: 365 },
+      certificate: { ...mockCertificate, daysLeft: 365, fractionRemaining: .92 },
       error: null,
       isLoading: false,
     }))

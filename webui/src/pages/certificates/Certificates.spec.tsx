@@ -124,10 +124,19 @@ describe('<CertificatesPage />', () => {
         commonName: 'orange.com',
         sans: ['orange.com'],
         issuerOrg: 'Test CA',
-        notAfter: new Date(Date.now() + 10 * 24 * 60 * 60 * 1000).toISOString(), // 10 days = orange
+        notAfter: new Date(Date.now() + 10 * 24 * 60 * 60 * 1000).toISOString(), // 10 days = orange on a 40 day cert
         notBefore: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
         status: 'warning',
       },
+      {
+        name: 'f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6',
+        commonName: 'greenshort.com',
+        sans: ['greenshort.com'],
+        issuerOrg: 'Test CA',
+        notAfter: new Date(Date.now() + 4 * 24 * 60 * 60 * 1000).toISOString(), // 4 days = green on a 6 day cert
+        notBefore: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
+        status: 'warning',
+      }
     ].map(CertificateRenderRow)
 
     const { container } = renderWithProviders(
@@ -144,12 +153,11 @@ describe('<CertificatesPage />', () => {
     )
 
     const tbody = container.querySelectorAll('div[role="table"] > div[role="rowgroup"]')[1]
-    expect(tbody.querySelectorAll('a[role="row"]')).toHaveLength(2)
+    expect(tbody.querySelectorAll('a[role="row"]')).toHaveLength(3)
 
-    // Green badge for >14 days
+    // make sure these render on the page
     expect(tbody.querySelectorAll('a[role="row"]')[0].innerHTML).toContain('green.com')
-
-    // Orange badge for <14 days
     expect(tbody.querySelectorAll('a[role="row"]')[1].innerHTML).toContain('orange.com')
+    expect(tbody.querySelectorAll('a[role="row"]')[2].innerHTML).toContain('greenshort.com')
   })
 })
