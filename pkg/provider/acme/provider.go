@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -54,6 +55,7 @@ type Configuration struct {
 	KeyType              string   `description:"KeyType used for generating certificate private key. Allow value 'EC256', 'EC384', 'RSA2048', 'RSA4096', 'RSA8192'." json:"keyType,omitempty" toml:"keyType,omitempty" yaml:"keyType,omitempty" export:"true"`
 	EAB                  *EAB     `description:"External Account Binding to use." json:"eab,omitempty" toml:"eab,omitempty" yaml:"eab,omitempty"`
 	CertificatesDuration int      `description:"Certificates' duration in hours." json:"certificatesDuration,omitempty" toml:"certificatesDuration,omitempty" yaml:"certificatesDuration,omitempty" export:"true"`
+	DisableARI           bool     `description:"Disable ACME Renewal Information (ARI) for certificate renewals." json:"disableARI,omitempty" toml:"disableARI,omitempty" yaml:"disableARI,omitempty" export:"true"`
 
 	ClientTimeout               ptypes.Duration `description:"Timeout for a complete HTTP transaction with the ACME server." json:"clientTimeout,omitempty" toml:"clientTimeout,omitempty" yaml:"clientTimeout,omitempty" label:"allowEmpty" file:"allowEmpty" export:"true"`
 	ClientResponseHeaderTimeout ptypes.Duration `description:"Timeout for receiving the response headers when communicating with the ACME server." json:"clientResponseHeaderTimeout,omitempty" toml:"clientResponseHeaderTimeout,omitempty" yaml:"clientResponseHeaderTimeout,omitempty" label:"allowEmpty" file:"allowEmpty" export:"true"`
@@ -252,20 +254,35 @@ func (p *Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.
 
 	p.configurationChan <- msg
 
-	renewPeriod, renewInterval := getCertificateRenewDurations(p.CertificatesDuration)
-	logger.Debug().Msgf("Attempt to renew certificates %q before expiry and check every %q",
-		renewPeriod, renewInterval)
+	p.certificatesMu.RLock()
 
-	p.renewCertificates(ctx, renewPeriod)
+	// there's a weird quirk for folks using the `shortlived` profile for LetsEncrypt. If they don't explicitly set the
+	// CertificatesDuration, we assume its 90 days and will immediately renew which can cause issues down the line. So
+	// here, look at any certs we have and compute periods and intervals off the shortest. note that this will likely
+	// get blown away immediately if the user is using ARI
+	minCertificateDuration := p.CertificatesDuration
+	for _, curr := range p.certificates {
+		x509Cert, err := getX509Certificate(ctx, &curr.Certificate)
+		if err != nil {
+			logger.Warn().Msgf("could not parse certificate: %+v", err)
+			continue
+		}
+		certDurationHours := int(math.Floor(x509Cert.NotAfter.Sub(x509Cert.NotBefore).Hours()))
+		minCertificateDuration = min(certDurationHours, minCertificateDuration)
+	}
+	p.certificatesMu.RUnlock()
 
-	ticker := time.NewTicker(renewInterval)
+	_, renewInterval := getCertificateRenewDurations(minCertificateDuration)
+
+	timeTillNextCheck := p.renewCertificates(ctx, renewInterval)
+
 	pool.GoCtx(func(ctxPool context.Context) {
 		for {
+			logger.Info().Msgf("Sleeping %.2f minutes until next cert renewal check", timeTillNextCheck.Minutes())
 			select {
-			case <-ticker.C:
-				p.renewCertificates(ctx, renewPeriod)
+			case <-time.After(timeTillNextCheck):
+				timeTillNextCheck = p.renewCertificates(ctx, renewInterval)
 			case <-ctxPool.Done():
-				ticker.Stop()
 				return
 			}
 		}
@@ -939,6 +956,23 @@ func searchUncheckedDomains(ctx context.Context, domainsToCheck, existentDomains
 		logger.Debug().Strs("domains", domainsToCheck).Msgf("Domains need ACME certificates generation for domains %q.", strings.Join(uncheckedDomains, ","))
 	}
 	return uncheckedDomains
+}
+
+func getX509CertificateFromBytes(certBytes []byte, keyBytes []byte) (*x509.Certificate, error) {
+	tlsCert, err := tls.X509KeyPair(certBytes, keyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("getX509CertificateFromBytes: failed to load TLS key pair from ACME certificate for domain: %w", err)
+	}
+
+	crt := tlsCert.Leaf
+	if crt == nil {
+		crt, err = x509.ParseCertificate(tlsCert.Certificate[0])
+		if err != nil {
+			return nil, fmt.Errorf("getX509CertificateFromBytes: failed to parse TLS key pair from ACME certificate for domain, certificate will be renewed")
+		}
+	}
+
+	return crt, err
 }
 
 func getX509Certificate(ctx context.Context, cert *Certificate) (*x509.Certificate, error) {

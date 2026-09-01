@@ -9,10 +9,10 @@ import (
 	"slices"
 	"time"
 
-	"github.com/go-acme/lego/v4/acme/api"
-	"github.com/go-acme/lego/v4/certcrypto"
-	"github.com/go-acme/lego/v4/certificate"
-	"github.com/go-acme/lego/v4/lego"
+	"github.com/go-acme/lego/v5/acme/api"
+	"github.com/go-acme/lego/v5/certcrypto"
+	"github.com/go-acme/lego/v5/certificate"
+	"github.com/go-acme/lego/v5/lego"
 	"github.com/rs/zerolog/log"
 )
 
@@ -71,7 +71,7 @@ func certLifetimeHours(crt *x509.Certificate) int {
 func (p *Provider) checkARIRenewal(ctx context.Context, x509Cert *x509.Certificate, renewInterval time.Duration) (bool, string, time.Duration, error) {
 	// per RFC9773 4.3, we should not check ARI if certificate is expired
 	if time.Now().After(x509Cert.NotAfter) {
-		certID, err := certificate.MakeARICertID(x509Cert)
+		certID, err := api.MakeARICertID(x509Cert)
 		if err != nil {
 			return false, "", 0, err
 		}
@@ -83,9 +83,7 @@ func (p *Provider) checkARIRenewal(ctx context.Context, x509Cert *x509.Certifica
 		return false, "", 0, err
 	}
 
-	info, err := client.Certificate.GetRenewalInfo(certificate.RenewalInfoRequest{
-		Cert: x509Cert,
-	})
+	info, err := client.Certificate.GetRenewalInfo(ctx, x509Cert)
 	if err != nil {
 		// this may return ErrNoARI in the case that ARI is not supported, caller should check for this
 		return false, "", 0, err
@@ -108,7 +106,7 @@ func (p *Provider) checkARIRenewal(ctx context.Context, x509Cert *x509.Certifica
 		return false, "", renewAt.Sub(time.Now()), nil
 	}
 
-	certID, err := certificate.MakeARICertID(x509Cert)
+	certID, err := api.MakeARICertID(x509Cert)
 	if err != nil {
 		// in this case, we had an error computing the replaces ID. we should still renew, however, so indicate that to
 		// the caller
@@ -132,7 +130,7 @@ func (p *Provider) renewCertificateWithARI(ctx context.Context, client *lego.Cli
 		PreferredChain: p.PreferredChain,
 		ReplacesCertID: crt.renewalID,
 	}
-	renewedCert, err := client.Certificate.Obtain(request)
+	renewedCert, err := client.Certificate.Obtain(ctx, request)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +144,7 @@ func (p *Provider) renewCertificateLegacy(ctx context.Context, client *lego.Clie
 	logger.Info().Msgf("Renewing ACME certificate: %+v", crt.cs.Domain)
 
 	res := certificate.Resource{
-		Domain:      crt.cs.Domain.Main,
+		Domains:     crt.cs.Domain.ToStrArray(),
 		PrivateKey:  crt.cs.Key,
 		Certificate: crt.cs.Certificate.Certificate,
 	}
@@ -158,7 +156,7 @@ func (p *Provider) renewCertificateLegacy(ctx context.Context, client *lego.Clie
 		PreferredChain: p.PreferredChain,
 	}
 
-	renewedCert, err := client.Certificate.RenewWithOptions(res, opts)
+	renewedCert, err := client.Certificate.Renew(ctx, res, opts)
 	if err != nil {
 		return nil, err
 	}
