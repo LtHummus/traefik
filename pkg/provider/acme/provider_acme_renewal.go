@@ -120,6 +120,11 @@ func (p *Provider) checkARIRenewal(ctx context.Context, x509Cert *x509.Certifica
 func (p *Provider) renewCertificateWithARI(ctx context.Context, client *lego.Client, crt *certRenewalInfo) (*certificate.Resource, error) {
 	logger := log.Ctx(ctx)
 
+	privateKey, err := certcrypto.ParsePEMPrivateKey(crt.cs.Key)
+	if err != nil {
+		return nil, fmt.Errorf("could not parse private key for ARI renew: %w", err)
+	}
+
 	logger.Info().Msgf("Renewing certificate via ARI (replaces %s): %+v", crt.renewalID, crt.cs.Domain)
 	domains := certcrypto.ExtractDomains(crt.x509Cert)
 	request := certificate.ObtainRequest{
@@ -129,6 +134,7 @@ func (p *Provider) renewCertificateWithARI(ctx context.Context, client *lego.Cli
 		Profile:        p.Profile,
 		PreferredChain: p.PreferredChain,
 		ReplacesCertID: crt.renewalID,
+		PrivateKey:     privateKey,
 	}
 	renewedCert, err := client.Certificate.Obtain(ctx, request)
 	if err != nil {
